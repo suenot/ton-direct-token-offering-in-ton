@@ -1,0 +1,208 @@
+;; Direct Token Offering Contract using native TON
+;; All necessary functions are built into FunC
+
+;; Storage
+;; storage#_ owner_address:MsgAddress
+;;         mm_address:MsgAddress
+;;         mm_to_ton_rate:uint32
+;;         seqno:uint32 = Storage;
+
+(slice, slice, int, int) load_data() inline {
+  var ds = get_data().begin_parse();
+  return (
+      ds~load_msg_addr(),  ;; owner_address
+      ds~load_msg_addr(),  ;; mm_address
+      ds~load_uint(32),    ;; mm_to_ton_rate
+      ds~load_uint(32)     ;; seqno
+  );
+}
+
+() save_data(slice owner_address, slice mm_address, int mm_to_ton_rate, int seqno) impure inline {
+    set_data(begin_cell()
+      .store_slice(owner_address)
+      .store_slice(mm_address)
+      .store_uint(mm_to_ton_rate, 32)
+      .store_uint(seqno, 32)
+      .end_cell());
+}
+
+;; Check if sender is the owner
+() check_owner() inline {
+  var (owner_address, _, _, _) = load_data();
+  throw_unless(401, equal_slices(sender_address(), owner_address));
+}
+
+;; Owner can change the token exchange rate
+() change_rate(slice in_msg_body) impure {
+  check_owner();
+  
+  var (owner_address, mm_address, _, seqno) = load_data();
+  int new_rate = in_msg_body~load_uint(32);
+  
+  throw_unless(402, new_rate > 0);
+  
+  save_data(owner_address, mm_address, new_rate, seqno);
+}
+
+;; Owner can withdraw all TON
+() withdraw_ton(slice in_msg_body) impure {
+  check_owner();
+  
+  var (owner_address, mm_address, mm_to_ton_rate, seqno) = load_data();
+  
+  ;; Create a message for TON withdrawal
+  var msg = begin_cell()
+      .store_uint(0x10, 6) ;; internal message, bounce flag = 1
+      .store_slice(owner_address)
+      .store_coins(0) ;; all remaining TON except for gas
+      .store_uint(0, 1 + 4 + 4 + 64 + 32) ;; default message header (1 + 4 + 4 + 64 + 32 = 105 bits)
+      .store_uint(0, 32) ;; empty body
+      .end_cell();
+      
+  ;; Send the message
+  send_raw_message(msg, 128); ;; mode 128 = carry all value, ignore errors
+}
+
+;; Owner can withdraw remaining MM tokens
+() withdraw_mm(slice in_msg_body) impure {
+  check_owner();
+  
+  var (owner_address, mm_address, mm_to_ton_rate, seqno) = load_data();
+  int ton_amount = in_msg_body~load_coins();
+  
+  throw_unless(403, ton_amount >= 100000000); ;; Minimum 0.1 TON
+  
+  ;; Create a message to transfer MM tokens
+  var msg = begin_cell()
+      .store_uint(0x10, 6) ;; internal message, bounce flag = 1
+      .store_slice(mm_address)
+      .store_coins(100000000) ;; 0.1 TON for gas
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; default message header + storeref (1 + 4 + 4 + 64 + 32 + 1 + 1 = 107 bits)
+      .store_ref(begin_cell()
+          .store_uint(0x0f8a7ea5, 32) ;; Transfer operation (taken from TEP-74)
+          .store_uint(0, 64) ;; query_id
+          .store_slice(owner_address) ;; destination address
+          .store_coins(ton_amount) ;; amount to withdraw
+          .store_uint(0, 1) ;; no custom payload
+          .store_uint(0, 1) ;; no forward_ton_amount and forward_payload
+          .end_cell()
+      )
+      .end_cell();
+      
+  ;; Send the message
+  send_raw_message(msg, 1); ;; pay transfer fees separately
+}
+
+;; Process incoming TON, send MM tokens
+() buy_tokens(slice in_msg_body, int msg_value) impure {
+  ;; Skip a large incoming message to avoid the cell depth issue
+  throw_if(404, in_msg_body.slice_refs() > 0);
+
+  ;; Load data once
+  var (owner_address, mm_address, mm_to_ton_rate, seqno) = load_data();
+  
+  ;; Extract TON amount and calculate MM tokens to send
+  int amount = in_msg_body~load_coins();
+  amount = msg_value; ;; Override with actual received amount
+  
+  throw_unless(405, amount >= 100000000); ;; Minimum 0.1 TON
+  
+  int balance = get_balance().pair_first();
+  int mm_amount = (amount * mm_to_ton_rate) / 1000000000; ;; Convert TON to MM tokens
+  
+  ;; Create a message to transfer MM tokens to the sender
+  var msg = begin_cell()
+      .store_uint(0x10, 6) ;; internal message, bounce flag = 1
+      .store_slice(mm_address)
+      .store_coins(100000000) ;; 0.1 TON for gas
+      .store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1) ;; default message header + storeref (1 + 4 + 4 + 64 + 32 + 1 + 1 = 107 bits)
+      .store_ref(begin_cell()
+          .store_uint(0x0f8a7ea5, 32) ;; Transfer operation (taken from TEP-74)
+          .store_uint(0, 64) ;; query_id
+          .store_slice(sender_address()) ;; destination address
+          .store_coins(mm_amount) ;; amount of MM tokens
+          .store_uint(0, 1) ;; no custom payload
+          .store_uint(0, 1) ;; no forward_ton_amount and forward_payload
+          .end_cell()
+      )
+      .end_cell();
+      
+  ;; Send the message
+  send_raw_message(msg, 1); ;; pay transfer fees separately
+  
+  ;; Increment seqno
+  save_data(owner_address, mm_address, mm_to_ton_rate, seqno + 1);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  ;; Parse incoming message
+  slice cs = in_msg_full.begin_parse();
+  int flags = cs~load_uint(4);
+  
+  ;; Ignore bounced messages
+  if (flags & 1) {
+    return ();
+  }
+  
+  ;; Skip all service information
+  cs~load_msg_addr(); ;; Skip source address
+  cs~load_msg_addr(); ;; Skip destination address
+  cs~load_coins();    ;; Skip amount
+  cs~skip_bits(1);    ;; Skip extracurrency collection
+  cs~load_coins();    ;; Skip ihr_fee
+  cs~load_coins();    ;; Skip fwd_fee
+  cs~load_uint(64);   ;; Skip created_lt
+  cs~load_uint(32);   ;; Skip created_at
+  
+  ;; Empty message or simple TON transfer - interpret as buy tokens
+  if (in_msg_body.slice_bits() == 0 || (in_msg_body.slice_bits() == 32 && in_msg_body.preload_uint(32) == 0)) {
+    buy_tokens(in_msg_body, msg_value);
+    return ();
+  }
+  
+  ;; Parse op (operation code)
+  int op = in_msg_body~load_uint(32);
+  
+  ;; Handle operations
+  if (op == 1) { ;; Change rate
+    change_rate(in_msg_body);
+    return ();
+  }
+  if (op == 2) { ;; Withdraw TON
+    withdraw_ton(in_msg_body);
+    return ();
+  }
+  if (op == 3) { ;; Withdraw MM tokens
+    withdraw_mm(in_msg_body);
+    return ();
+  }
+  
+  ;; If no operation matched, fallback to buying tokens
+  buy_tokens(in_msg_body, msg_value);
+}
+
+;; Get methods
+
+;; Returns exchange rate for MM tokens in TON
+int get_mm_to_ton_rate() method_id {
+  var (_, _, mm_to_ton_rate, _) = load_data();
+  return mm_to_ton_rate;
+}
+
+;; Returns owner address
+slice get_owner_address() method_id {
+  var (owner_address, _, _, _) = load_data();
+  return owner_address;
+}
+
+;; Returns MM token address
+slice get_mm_address() method_id {
+  var (_, mm_address, _, _) = load_data();
+  return mm_address;
+}
+
+;; Returns seqno
+int get_seqno() method_id {
+  var (_, _, _, seqno) = load_data();
+  return seqno;
+}

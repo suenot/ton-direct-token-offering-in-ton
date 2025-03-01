@@ -1,0 +1,35 @@
+{
+  "name": "ton-direct-token-offering-in-ton",
+  "version": "1.0.0",
+  "description": "Smart contract for direct token offerings on TON using native TON coins",
+  "main": "deploy.ts",
+  "scripts": {
+    "build": "npx func-js direct_token_offering.fc --boc direct_token_offering.fc.cell --version 0.4.0",
+    "compile": "tsc",
+    "deploy": "npm run build && npm run compile && node dist/deploy.js"
+  },
+  "keywords": [
+    "ton",
+    "blockchain",
+    "token",
+    "offering",
+    "ico",
+    "dto"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@orbs-network/ton-access": "^2.3.3",
+    "@ton/core": "^0.60.1",
+    "@ton/crypto": "^3.2.0",
+    "@ton/ton": "^15.2.1",
+    "buffer": "^6.0.3",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@ton-community/func-js": "^0.4.0",
+    "@types/node": "^20.8.2",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.2.2"
+  }
+}
